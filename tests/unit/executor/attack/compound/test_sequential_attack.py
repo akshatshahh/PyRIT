@@ -3,6 +3,10 @@
 
 """Tests for ``SequentialAttack``."""
 
+import asyncio
+import uuid
+from collections.abc import Sequence
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,14 +23,17 @@ from pyrit.executor.attack.core.attack_executor import AttackExecutor, AttackExe
 from pyrit.executor.attack.core.attack_parameters import AttackParameters
 from pyrit.executor.attack.core.attack_result_attribution import AttackResultAttribution
 from pyrit.executor.attack.core.attack_strategy import AttackContext, AttackStrategy
+from pyrit.memory import MemoryInterface
 from pyrit.models import (
     AttackOutcome,
     AttackResult,
     AttackResultRole,
+    AttackResultSelection,
     AttackSeedGroup,
     ScoringExpectation,
     SeedObjective,
 )
+from pyrit.prompt_target import PromptTarget
 
 
 def _make_strategy(*, outcomes: list[AttackOutcome], name: str = "attack") -> MagicMock:
@@ -62,7 +69,7 @@ def _patch_run_child_attack(*, strategies_by_id: dict[int, MagicMock]):
     counters: dict[int, int] = dict.fromkeys(strategies_by_id, 0)
     calls: list[dict] = []
 
-    async def _stub(self, *, child_attack, memory_labels, attribution=None, expectation=None):
+    async def _stub(self, *, child_attack, memory_labels, child_result_ids, attribution=None, expectation=None):
         sid = id(child_attack.strategy)
         idx = counters[sid]
         counters[sid] = idx + 1
@@ -632,7 +639,7 @@ class TestResultShape:
 
         captured_ids: list[str] = []
 
-        async def _stub(self, *, child_attack, memory_labels, attribution=None, expectation=None):
+        async def _stub(self, *, child_attack, memory_labels, child_result_ids, attribution=None, expectation=None):
             inner = AttackResult(
                 conversation_id=f"c-{child_attack.strategy._name}",
                 objective="obj",
@@ -653,7 +660,7 @@ class TestResultShape:
 
         inner_ids: list[str] = []
 
-        async def _stub(self, *, child_attack, memory_labels, attribution=None, expectation=None):
+        async def _stub(self, *, child_attack, memory_labels, child_result_ids, attribution=None, expectation=None):
             inner = AttackResult(conversation_id="c", objective="obj", outcome=AttackOutcome.SUCCESS)
             inner_ids.append(inner.attack_result_id)
             return inner
@@ -744,7 +751,7 @@ class TestResultShape:
         child_attacks = [SequentialChildAttack(strategy=s, seed_group=seed_group) for s in (a, b)]
         compound = SequentialAttack(objective_target=target, child_attacks=child_attacks)
 
-        async def _stub(self, *, child_attack, memory_labels, attribution=None, expectation=None):
+        async def _stub(self, *, child_attack, memory_labels, child_result_ids, attribution=None, expectation=None):
             return AttackResult(
                 conversation_id="c",
                 objective="obj",
@@ -761,50 +768,35 @@ class TestResultShape:
 class _OkChildStrategy(AttackStrategy[AttackContext[AttackParameters], AttackResult]):
     """Minimal real strategy that completes successfully (no live target)."""
 
-    def __init__(self, *, objective_target):
+    def __init__(self, *, objective_target: PromptTarget) -> None:
         super().__init__(
             objective_target=objective_target,
             context_type=AttackContext,
             params_type=AttackParameters,
         )
 
-    def _validate_context(self, *, context):
+    def _validate_context(self, *, context: AttackContext[AttackParameters]) -> None:
         pass
 
-    async def _setup_async(self, *, context):
+    async def _setup_async(self, *, context: AttackContext[AttackParameters]) -> None:
         pass
 
-    async def _teardown_async(self, *, context):
+    async def _teardown_async(self, *, context: AttackContext[AttackParameters]) -> None:
         pass
 
-    async def _perform_async(self, *, context):
+    async def _perform_async(self, *, context: AttackContext[AttackParameters]) -> AttackResult:
         return AttackResult(
-            conversation_id="conv-ok",
+            conversation_id=str(uuid.uuid4()),
             objective=context.objective,
             outcome=AttackOutcome.SUCCESS,
+            labels=context.memory_labels,
         )
 
 
-class _BoomChildStrategy(AttackStrategy[AttackContext[AttackParameters], AttackResult]):
+class _BoomChildStrategy(_OkChildStrategy):
     """Minimal real strategy that raises from ``_perform_async`` (no live target)."""
 
-    def __init__(self, *, objective_target):
-        super().__init__(
-            objective_target=objective_target,
-            context_type=AttackContext,
-            params_type=AttackParameters,
-        )
-
-    def _validate_context(self, *, context):
-        pass
-
-    async def _setup_async(self, *, context):
-        pass
-
-    async def _teardown_async(self, *, context):
-        pass
-
-    async def _perform_async(self, *, context):
+    async def _perform_async(self, *, context: AttackContext[AttackParameters]) -> AttackResult:
         raise RuntimeError("child boom")
 
 
@@ -901,3 +893,274 @@ class TestChildFailurePreservesLinks:
         assert parent.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [child_error.attack_result_id]
         # The Scenario attribution still reaches the persisted parent error result.
         assert parent.attribution_parent_id == "8a8d17b9-b671-4a3d-8170-e65ea9b44053"
+
+    async def test_concurrent_shared_exception_keeps_child_links_isolated_async(
+        self, seed_group: AttackSeedGroup, sqlite_instance: MemoryInterface
+    ) -> None:
+        target = MockPromptTarget()
+        child = _BoomChildStrategy(objective_target=target)
+        sequences = [
+            SequentialAttack(
+                objective_target=target,
+                child_attacks=[SequentialChildAttack(strategy=child, seed_group=seed_group)],
+            )
+            for _ in range(2)
+        ]
+        failure = RuntimeError("shared child failure")
+        persist = sqlite_instance.add_attack_results_to_memory_async
+        both_children_persisted = asyncio.Event()
+        child_writes = 0
+
+        async def persist_children_together_async(*, attack_results: Sequence[AttackResult]) -> None:
+            nonlocal child_writes
+            await persist(attack_results=attack_results)
+            if attack_results[0].attribution_data["result_role"] == AttackResultRole.TARGET_FACING.value:
+                child_writes += 1
+                if child_writes == 2:
+                    both_children_persisted.set()
+                await both_children_persisted.wait()
+
+        with (
+            patch.object(child, "_perform_async", new_callable=AsyncMock, side_effect=failure),
+            patch.object(
+                sqlite_instance, "add_attack_results_to_memory_async", side_effect=persist_children_together_async
+            ),
+        ):
+            failures = await asyncio.wait_for(
+                asyncio.gather(
+                    *[
+                        sequence.execute_async(objective="obj", memory_labels={"execution": str(index)})
+                        for index, sequence in enumerate(sequences)
+                    ],
+                    return_exceptions=True,
+                ),
+                timeout=10,
+            )
+
+        assert all(isinstance(error, RuntimeError) for error in failures)
+        for index in range(2):
+            rows = await sqlite_instance.get_attack_results_async(labels={"execution": str(index)})
+            [parent] = [row for row in rows if row.attribution_data["result_role"] == "orchestration"]
+            [stored_child] = [row for row in rows if row.attribution_data["result_role"] == "target_facing"]
+            assert parent.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [stored_child.attack_result_id]
+        assert not hasattr(failure, "_pyrit_error_result_id")
+        assert not hasattr(failure, "_pyrit_error_result_metadata")
+
+    @pytest.mark.parametrize("child_fails", [False, True])
+    @pytest.mark.parametrize("committed", [False, True])
+    async def test_uncertain_child_write_links_only_confirmed_rows_async(
+        self,
+        seed_group: AttackSeedGroup,
+        sqlite_instance: MemoryInterface,
+        child_fails: bool,
+        committed: bool,
+    ) -> None:
+        target = MockPromptTarget()
+        uncertain_child = (_BoomChildStrategy if child_fails else _OkChildStrategy)(objective_target=target)
+        skipped_child = _OkChildStrategy(objective_target=target)
+        compound = SequentialAttack(
+            objective_target=target,
+            child_attacks=[
+                SequentialChildAttack(strategy=_OkChildStrategy(objective_target=target), seed_group=seed_group),
+                SequentialChildAttack(
+                    strategy=uncertain_child, seed_group=seed_group, memory_labels={"child": "uncertain"}
+                ),
+                SequentialChildAttack(strategy=skipped_child, seed_group=seed_group),
+            ],
+            completion_policy=SequenceCompletionPolicy.EXHAUSTIVE,
+        )
+        persist = sqlite_instance.add_attack_results_to_memory_async
+        persistence_error = RuntimeError("commit acknowledgement lost")
+        uncertain_ids: list[str] = []
+
+        async def uncertain_write_async(*, attack_results: Sequence[AttackResult]) -> None:
+            if attack_results[0].labels.get("child") == "uncertain":
+                uncertain_ids.append(attack_results[0].attack_result_id)
+                if committed:
+                    await persist(attack_results=attack_results)
+                raise persistence_error
+            await persist(attack_results=attack_results)
+
+        with (
+            patch.object(sqlite_instance, "add_attack_results_to_memory_async", side_effect=uncertain_write_async),
+            patch.object(skipped_child, "_perform_async", new_callable=AsyncMock) as skipped,
+            pytest.raises(RuntimeError) as raised,
+        ):
+            await compound.execute_async(objective="obj")
+
+        skipped.assert_not_awaited()
+        assert len(uncertain_ids) == 1
+        if child_fails:
+            assert isinstance(raised.value.__cause__, ExceptionGroup)
+            assert raised.value.__cause__.exceptions[1] is persistence_error
+        else:
+            assert raised.value.__cause__ is persistence_error
+        rows = await sqlite_instance.get_attack_results_async(result_selection=AttackResultSelection.ALL_RESULTS)
+        [parent] = [row for row in rows if row.attribution_data["result_role"] == "orchestration"]
+        children = sorted(
+            (row for row in rows if row.attribution_data["result_role"] == "target_facing"),
+            key=lambda row: row.timestamp,
+        )
+        assert len(children) == 1 + int(committed)
+        assert parent.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [
+            child.attack_result_id for child in children
+        ]
+        assert (uncertain_ids[0] in parent.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY]) is committed
+
+    async def test_nested_uncertain_error_write_preserves_direct_child_links_async(
+        self, seed_group: AttackSeedGroup, sqlite_instance: MemoryInterface
+    ) -> None:
+        target = MockPromptTarget()
+        inner = SequentialAttack(
+            objective_target=target,
+            child_attacks=[
+                SequentialChildAttack(strategy=_BoomChildStrategy(objective_target=target), seed_group=seed_group)
+            ],
+        )
+        outer = SequentialAttack(
+            objective_target=target,
+            child_attacks=[
+                SequentialChildAttack(strategy=inner, seed_group=seed_group, memory_labels={"envelope": "inner"})
+            ],
+        )
+        persist = sqlite_instance.add_attack_results_to_memory_async
+        inner_writes = 0
+
+        async def persist_then_fail_inner_async(*, attack_results: Sequence[AttackResult]) -> None:
+            nonlocal inner_writes
+            await persist(attack_results=attack_results)
+            row = attack_results[0]
+            if row.attribution_data["result_role"] == "orchestration" and row.labels.get("envelope") == "inner":
+                inner_writes += 1
+                raise RuntimeError("inner commit acknowledgement lost")
+
+        with (
+            patch.object(
+                sqlite_instance, "add_attack_results_to_memory_async", side_effect=persist_then_fail_inner_async
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            await outer.execute_async(objective="obj")
+
+        assert inner_writes == 1
+        rows = await sqlite_instance.get_attack_results_async()
+        [leaf] = [row for row in rows if row.attribution_data["result_role"] == "target_facing"]
+        [inner_row] = [
+            row
+            for row in rows
+            if row.attribution_data["result_role"] == "orchestration" and row.labels.get("envelope") == "inner"
+        ]
+        [outer_row] = [
+            row
+            for row in rows
+            if row.attribution_data["result_role"] == "orchestration" and "envelope" not in row.labels
+        ]
+        assert inner_row.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [leaf.attack_result_id]
+        assert outer_row.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [inner_row.attack_result_id]
+
+    async def test_parameter_build_failure_keeps_only_completed_child_links_async(
+        self, seed_group: AttackSeedGroup, sqlite_instance: MemoryInterface
+    ) -> None:
+        target = MockPromptTarget()
+        compound = SequentialAttack(
+            objective_target=target,
+            child_attacks=[
+                SequentialChildAttack(strategy=_OkChildStrategy(objective_target=target), seed_group=seed_group)
+                for _ in range(3)
+            ],
+            completion_policy=SequenceCompletionPolicy.EXHAUSTIVE,
+        )
+        build = AttackParameters.from_seed_group_async
+        calls = 0
+
+        async def build_then_fail_async(**kwargs: Any) -> AttackParameters:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise ValueError("child preparation failed")
+            return await build(**kwargs)
+
+        with (
+            patch.object(AttackParameters, "from_seed_group_async", side_effect=build_then_fail_async),
+            pytest.raises(RuntimeError, match="child preparation failed"),
+        ):
+            await compound.execute_async(objective="obj")
+
+        assert calls == 2
+        rows = await sqlite_instance.get_attack_results_async()
+        [parent] = [row for row in rows if row.outcome is AttackOutcome.ERROR]
+        [child] = [row for row in rows if row.outcome is AttackOutcome.SUCCESS]
+        assert parent.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [child.attack_result_id]
+
+    async def test_reused_context_keeps_failure_links_separate_async(
+        self, seed_group: AttackSeedGroup, sqlite_instance: MemoryInterface
+    ) -> None:
+        target = MockPromptTarget()
+        compound = SequentialAttack(
+            objective_target=target,
+            child_attacks=[
+                SequentialChildAttack(strategy=_BoomChildStrategy(objective_target=target), seed_group=seed_group)
+            ],
+        )
+        context = _make_context()
+        links: list[list[str]] = []
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="child boom"):
+                await compound.execute_with_context_async(context=context)
+            [parent] = await sqlite_instance.get_attack_results_async(attack_result_ids=[context.attack_result_id])
+            links.append(parent.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY])
+        assert len(links[0]) == len(links[1]) == 1
+        assert set(links[0]).isdisjoint(links[1])
+
+    @pytest.mark.parametrize("child_fails", [False, True])
+    async def test_uncertain_write_lookup_failure_logs_without_masking_original_error_async(
+        self,
+        seed_group: AttackSeedGroup,
+        sqlite_instance: MemoryInterface,
+        caplog: pytest.LogCaptureFixture,
+        child_fails: bool,
+    ) -> None:
+        target = MockPromptTarget()
+        child = (_BoomChildStrategy if child_fails else _OkChildStrategy)(objective_target=target)
+        compound = SequentialAttack(
+            objective_target=target,
+            child_attacks=[SequentialChildAttack(strategy=child, seed_group=seed_group)],
+        )
+        persist = sqlite_instance.add_attack_results_to_memory_async
+        persistence_error = RuntimeError("commit acknowledgement lost")
+        writes = 0
+
+        async def persist_then_fail_child_async(*, attack_results: Sequence[AttackResult]) -> None:
+            nonlocal writes
+            writes += 1
+            await persist(attack_results=attack_results)
+            if attack_results[0].attribution_data["result_role"] == "target_facing":
+                raise persistence_error
+
+        with (
+            patch.object(
+                sqlite_instance, "add_attack_results_to_memory_async", side_effect=persist_then_fail_child_async
+            ),
+            patch.object(
+                sqlite_instance,
+                "get_attack_results_async",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("read failed"),
+            ) as confirm,
+            pytest.raises(RuntimeError) as raised,
+        ):
+            await compound.execute_async(objective="obj")
+
+        assert writes == 2
+        confirm.assert_awaited_once()
+        assert "Unable to confirm persisted attack result" in caplog.text
+        assert "read failed" in caplog.text
+        if child_fails:
+            assert isinstance(raised.value.__cause__, ExceptionGroup)
+            assert raised.value.__cause__.exceptions[1] is persistence_error
+        else:
+            assert raised.value.__cause__ is persistence_error
+        rows = await sqlite_instance.get_attack_results_async()
+        [parent] = [row for row in rows if row.attribution_data["result_role"] == "orchestration"]
+        assert len(rows) == 2
+        assert parent.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == []

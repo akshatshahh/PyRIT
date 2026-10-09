@@ -17,19 +17,6 @@ from typing import Any, cast
 
 from pyrit.models import ComponentIdentifier
 
-#: Exception attribute holding the ``attack_result_id`` of the error result
-#: persisted by the strategy error path. A catching orchestrator (e.g. a
-#: compound attack) reads this to link a failed child's stored result
-#: (microsoft/PyRIT#3039).
-ERROR_RESULT_ID_ATTR = "_pyrit_error_result_id"
-
-#: Exception attribute holding extra metadata to merge into the persisted
-#: error result. A failing strategy sets this before re-raising (e.g.
-#: SequentialAttack's child-result links, microsoft/PyRIT#3039); the error
-#: path merges it into the error result's metadata and consumes it so an
-#: outer orchestrator does not re-merge stale links.
-ERROR_RESULT_METADATA_ATTR = "_pyrit_error_result_metadata"
-
 
 class ComponentRole(Enum):
     """
