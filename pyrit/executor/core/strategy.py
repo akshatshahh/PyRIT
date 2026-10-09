@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from pyrit.common import default_values
 from pyrit.common.logger import logger
 from pyrit.exceptions import clear_execution_context, get_exception_execution_context, get_execution_context
+from pyrit.exceptions.exception_context import ERROR_RESULT_ID_ATTR
 from pyrit.exceptions.retry_collector import (
     RetryCollector,
     clear_retry_collector,
@@ -385,6 +386,13 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
                 error_message = f"Strategy execution failed for {self.__class__.__name__}: {str(e)}"
 
             runtime_error = _StrategyRuntimeError(error_message)
+            # Propagate the persisted error-result id (set by the strategy
+            # error path, e.g. microsoft/PyRIT#3039) so a catching
+            # orchestrator can link the failed child's stored result without
+            # walking the cause chain.
+            error_result_id = getattr(e, ERROR_RESULT_ID_ATTR, None)
+            if error_result_id is not None:
+                setattr(runtime_error, ERROR_RESULT_ID_ATTR, error_result_id)
             raise runtime_error from e
         finally:
             if retry_collector_started:

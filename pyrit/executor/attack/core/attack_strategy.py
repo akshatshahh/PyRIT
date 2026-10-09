@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, overload
 
 from pyrit.common.attack_result_scope import attack_result_id_scope
 from pyrit.common.logger import logger
+from pyrit.exceptions.exception_context import ERROR_RESULT_ID_ATTR, ERROR_RESULT_METADATA_ATTR
 from pyrit.exceptions.retry_collector import (
     get_retry_collector,
 )
@@ -566,6 +567,14 @@ class _DefaultAttackStrategyEventHandler(StrategyEventHandler[AttackStrategyCont
             total_retries=len(retry_events),
         )
 
+        # Merge extra error-result metadata the failing strategy attached to
+        # the exception (e.g. SequentialAttack's child-result links, #3039).
+        # Consumed here so an outer orchestrator does not re-merge stale links.
+        extra_metadata = getattr(error, ERROR_RESULT_METADATA_ATTR, None)
+        if extra_metadata:
+            error_result.metadata.update(extra_metadata)
+            delattr(error, ERROR_RESULT_METADATA_ATTR)
+
         end_time = time.perf_counter()
         if context.start_time:
             error_result.execution_time_ms = int((end_time - context.start_time) * 1000)
@@ -579,6 +588,13 @@ class _DefaultAttackStrategyEventHandler(StrategyEventHandler[AttackStrategyCont
             (await self._memory.add_attack_results_to_memory_async(attack_results=[error_result]))
         except Exception as persistence_error:
             context._error_result_persistence_error = persistence_error
+        else:
+            # Record the persisted error result's id on the exception so a
+            # catching orchestrator (e.g. a compound attack) can link the
+            # failed child's stored result (#3039). This follows the existing
+            # pattern of carrying failure context on the exception rather
+            # than the caller's ContextVar (see get_exception_execution_context).
+            setattr(error, ERROR_RESULT_ID_ATTR, error_result.attack_result_id)
 
         self._logger.error(f"Attack failed with {type(error).__name__}: {error}")
 

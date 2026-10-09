@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import Field
 
+from pyrit.exceptions.exception_context import ERROR_RESULT_ID_ATTR, ERROR_RESULT_METADATA_ATTR
 from pyrit.executor.attack.core.attack_executor import AttackExecutor
 from pyrit.executor.attack.core.attack_parameters import AttackParameters
 from pyrit.executor.attack.core.attack_strategy import AttackContext, AttackStrategy
@@ -251,19 +252,38 @@ class SequentialAttack(AttackStrategy[AttackContext[AttackParameters], Sequentia
     async def _perform_async(self, *, context: AttackContext[AttackParameters]) -> SequentialAttackResult:
         results: list[AttackResult] = []
 
-        for attempt_index, child_attack in enumerate(self._child_attacks, start=1):
-            labels = {**context.memory_labels, **dict(child_attack.memory_labels)}
-            # Each child shares the parent's attribution plus its own position.
-            attribution = replace(context._attribution, attempt_index=attempt_index) if context._attribution else None
-            result = await self._run_child_attack_async(
-                child_attack=child_attack,
-                memory_labels=labels,
-                attribution=attribution,
-                expectation=context.params.expectation,
-            )
-            results.append(result)
-            if self._should_stop_after(result=result):
-                break
+        try:
+            for attempt_index, child_attack in enumerate(self._child_attacks, start=1):
+                labels = {**context.memory_labels, **dict(child_attack.memory_labels)}
+                # Each child shares the parent's attribution plus its own position.
+                attribution = (
+                    replace(context._attribution, attempt_index=attempt_index) if context._attribution else None
+                )
+                result = await self._run_child_attack_async(
+                    child_attack=child_attack,
+                    memory_labels=labels,
+                    attribution=attribution,
+                    expectation=context.params.expectation,
+                )
+                results.append(result)
+                if self._should_stop_after(result=result):
+                    break
+        except BaseException as error:
+            # Preserve the child-result links on the parent's error result
+            # (microsoft/PyRIT#3039). The generic error path persists the
+            # parent envelope; attach the ids of children that produced
+            # stored results — completed children in dispatch order plus the
+            # failed child's persisted error result, surfaced on the
+            # exception by the error path — so they are merged into
+            # metadata["child_attack_result_ids"]. Re-raise unchanged to
+            # preserve exception propagation, outcome semantics, and
+            # retry/resume behavior.
+            child_ids = [r.attack_result_id for r in results]
+            failed_child_id = getattr(error, ERROR_RESULT_ID_ATTR, None)
+            if failed_child_id is not None:
+                child_ids.append(failed_child_id)
+            setattr(error, ERROR_RESULT_METADATA_ATTR, {self.CHILD_ATTACK_RESULT_IDS_KEY: child_ids})
+            raise
 
         outcome = self._compute_outcome(results=results)
 

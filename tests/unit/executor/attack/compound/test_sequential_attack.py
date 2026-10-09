@@ -17,7 +17,8 @@ from pyrit.executor.attack.compound import (
 )
 from pyrit.executor.attack.core.attack_executor import AttackExecutor, AttackExecutorResult
 from pyrit.executor.attack.core.attack_parameters import AttackParameters
-from pyrit.executor.attack.core.attack_strategy import AttackContext
+from pyrit.executor.attack.core.attack_result_attribution import AttackResultAttribution
+from pyrit.executor.attack.core.attack_strategy import AttackContext, AttackStrategy
 from pyrit.models import (
     AttackOutcome,
     AttackResult,
@@ -755,3 +756,148 @@ class TestResultShape:
             result = await compound._perform_async(context=_make_context())
 
         assert result.executed_turns == 6
+
+
+class _OkChildStrategy(AttackStrategy[AttackContext[AttackParameters], AttackResult]):
+    """Minimal real strategy that completes successfully (no live target)."""
+
+    def __init__(self, *, objective_target):
+        super().__init__(
+            objective_target=objective_target,
+            context_type=AttackContext,
+            params_type=AttackParameters,
+        )
+
+    def _validate_context(self, *, context):
+        pass
+
+    async def _setup_async(self, *, context):
+        pass
+
+    async def _teardown_async(self, *, context):
+        pass
+
+    async def _perform_async(self, *, context):
+        return AttackResult(
+            conversation_id="conv-ok",
+            objective=context.objective,
+            outcome=AttackOutcome.SUCCESS,
+        )
+
+
+class _BoomChildStrategy(AttackStrategy[AttackContext[AttackParameters], AttackResult]):
+    """Minimal real strategy that raises from ``_perform_async`` (no live target)."""
+
+    def __init__(self, *, objective_target):
+        super().__init__(
+            objective_target=objective_target,
+            context_type=AttackContext,
+            params_type=AttackParameters,
+        )
+
+    def _validate_context(self, *, context):
+        pass
+
+    async def _setup_async(self, *, context):
+        pass
+
+    async def _teardown_async(self, *, context):
+        pass
+
+    async def _perform_async(self, *, context):
+        raise RuntimeError("child boom")
+
+
+@pytest.mark.usefixtures("patch_central_database")
+class TestChildFailurePreservesLinks:
+    """The parent error result must retain child-result links (issue #3039)."""
+
+    async def test_parent_error_result_links_completed_and_failed_children(self, seed_group, sqlite_instance):
+        target = MockPromptTarget()
+        compound = SequentialAttack(
+            objective_target=target,
+            child_attacks=[
+                SequentialChildAttack(strategy=_OkChildStrategy(objective_target=target), seed_group=seed_group),
+                SequentialChildAttack(strategy=_BoomChildStrategy(objective_target=target), seed_group=seed_group),
+            ],
+            completion_policy=SequenceCompletionPolicy.EXHAUSTIVE,
+        )
+
+        # Exception propagation is preserved: the child error still raises.
+        with pytest.raises(RuntimeError, match="child boom"):
+            await compound.execute_async(objective="obj")
+
+        memory = sqlite_instance
+        error_results = await memory.get_attack_results_async(objective="obj", outcome="error")
+        assert len(error_results) == 2
+        # The parent envelope is persisted after the failed child.
+        parent = max(error_results, key=lambda r: r.timestamp)
+        child_error = min(error_results, key=lambda r: r.timestamp)
+        success_results = await memory.get_attack_results_async(objective="obj", outcome="success")
+        assert len(success_results) == 1
+
+        # Dispatch order: completed children first, then the failed child's
+        # persisted error result. No invented ids.
+        assert parent.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [
+            success_results[0].attack_result_id,
+            child_error.attack_result_id,
+        ]
+        # The child error result itself carries no child links.
+        assert child_error.metadata.get(SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY) is None
+
+    async def test_nested_compound_links_each_level(self, seed_group, sqlite_instance):
+        target = MockPromptTarget()
+        inner = SequentialAttack(
+            objective_target=target,
+            child_attacks=[
+                SequentialChildAttack(strategy=_BoomChildStrategy(objective_target=target), seed_group=seed_group),
+            ],
+        )
+        outer = SequentialAttack(
+            objective_target=target,
+            child_attacks=[
+                SequentialChildAttack(strategy=inner, seed_group=seed_group),
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="child boom"):
+            await outer.execute_async(objective="obj")
+
+        memory = sqlite_instance
+        error_results = await memory.get_attack_results_async(objective="obj", outcome="error")
+        assert len(error_results) == 3
+        by_time = sorted(error_results, key=lambda r: r.timestamp)
+        leaf_error, inner_error, outer_error = by_time
+
+        # Each envelope links its direct children in dispatch order.
+        assert inner_error.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [leaf_error.attack_result_id]
+        assert outer_error.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [inner_error.attack_result_id]
+        assert leaf_error.metadata.get(SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY) is None
+
+    async def test_scenario_attributed_execution_links_children(self, seed_group, sqlite_instance):
+        target = MockPromptTarget()
+        compound = SequentialAttack(
+            objective_target=target,
+            child_attacks=[
+                SequentialChildAttack(strategy=_BoomChildStrategy(objective_target=target), seed_group=seed_group),
+            ],
+            completion_policy=SequenceCompletionPolicy.EXHAUSTIVE,
+        )
+        context = _make_context()
+        context._attribution = AttackResultAttribution(
+            parent_id="8a8d17b9-b671-4a3d-8170-e65ea9b44053",
+            parent_collection="test-scenario",
+        )
+
+        with pytest.raises(RuntimeError, match="child boom"):
+            await compound.execute_with_context_async(context=context)
+
+        memory = sqlite_instance
+        error_results = await memory.get_attack_results_async(objective="obj", outcome="error")
+        assert len(error_results) == 2
+        parent = max(error_results, key=lambda r: r.timestamp)
+        child_error = min(error_results, key=lambda r: r.timestamp)
+
+        assert parent.metadata[SequentialAttack.CHILD_ATTACK_RESULT_IDS_KEY] == [child_error.attack_result_id]
+        # The Scenario attribution still reaches the persisted parent error result.
+        assert parent.attribution_parent_id == "8a8d17b9-b671-4a3d-8170-e65ea9b44053"
